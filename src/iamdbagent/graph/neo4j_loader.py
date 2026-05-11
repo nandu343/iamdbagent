@@ -139,6 +139,36 @@ def seed_mock_data(uri: str, user: str, password: str):
             r="CloudOps", a="iam:DeleteUser", res="*",
         ))
 
+        # Add a non-human service account with AdministratorAccess (unused)
+        svc_name = "svc-backup"
+        session.execute_write(_tx_upsert_user, svc_name, None)
+        # create a managed policy node for AdministratorAccess
+        admin_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
+        session.execute_write(lambda tx, a, n: tx.run("MERGE (p:Policy {arn:$arn}) SET p.name=$name", arn=a, name=n), admin_arn, "AdministratorAccess")
+        # create a broad Permission node that represents admin privileges
+        session.execute_write(_tx_upsert_permission, "*", "*", one_eighty_days_ago)
+        # link policy -> permission
+        session.execute_write(lambda tx: tx.run(
+            "MATCH (p:Policy {arn:$arn}) MATCH (perm:Permission {action:$a, resource:$r}) MERGE (p)-[:GRANTS]->(perm)",
+            arn=admin_arn, a="*", r="*",
+        ))
+        # link service account -> policy (attached)
+        session.execute_write(lambda tx: tx.run(
+            "MATCH (u:User {name:$u}) MATCH (p:Policy {arn:$arn}) MERGE (u)-[:HAS_POLICY]->(p)",
+            u=svc_name, arn=admin_arn,
+        ))
+
+        # Add service account for Terraform runner with an unused iam:* permission
+        svc_tf = "svc-terraform-runner"
+        session.execute_write(_tx_upsert_user, svc_tf, None)
+        # create a Permission node for iam:*
+        session.execute_write(_tx_upsert_permission, "iam:*", "*", one_eighty_days_ago)
+        # attach directly to user (simulates inline over-privileged creds)
+        session.execute_write(lambda tx: tx.run(
+            "MATCH (u:User {name:$u}) MATCH (p:Permission {action:$a, resource:$r}) MERGE (u)-[:HAS_PERMISSION]->(p)",
+            u=svc_tf, a="iam:*", r="*",
+        ))
+
     driver.close()
 
 
