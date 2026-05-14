@@ -214,16 +214,35 @@ def _validate_llm_output(parsed: Dict[str, Any], schema_name: str) -> Optional[s
         return str(e)
 
 
-def _build_system_prompt() -> str:
-    return (
+def _build_system_prompt(rag_context: str = "") -> str:
+    base = (
         "You are a Senior IAM Engineer. Given raw findings from an IAM graph and any transitive path contexts, produce a "
         "single JSON object with the following schema:\n{\n  \"findings\": [ {\n    \"action\": \"<action>\",\n    \"resource\": \"<resource>\",\n    \"last_used\": \"<iso>\",\n    \"roles\": [\"role1\"],\n    \"risk\": \"LOW|MEDIUM|HIGH\",\n    \"risk_score\": \"<1-10>\",\n    \"risk_score_after\": \"<1-10|null>\",\n    \"mitre_technique\": \"<TXXXX>\",\n    \"justification\": \"<text>\",\n    \"suggested_policy\": {\n      \"Version\": \"2012-10-17\",\n      \"Statement\": [ { \"Effect\": \"Allow\", \"Action\": [\"...\"], \"Resource\": [\"...\"] } ]\n    },\n    \"remediation_steps\": [\"Remove user from group X\", \"Detach policy Y from role Z\"]\n  } ],\n  \"shadow_admin_paths\": [ {\n    \"user\": \"<user>\",\n    \"action\": \"<action>\",\n    \"resource\": \"<resource>\",\n    \"path\": [ { \"labels\": [\"User\"], \"props\": {\"name\": \"Alice\"} }, ... ]\n  } ],\n  \"overall_risk\": \"LOW|MEDIUM|HIGH\",\n  \"summary\": \"<text>\",\n  \"executive_summary\": \"<one-paragraph CISO-friendly summary of risk reduction and business impact>\"\n}\n\n"
         "Be explicit: for each finding include a `mitre_technique` (e.g. TXXXX) and a numeric `risk_score` (1-10). If you propose a remediation, include an estimated `risk_score_after` (1-10) showing the expected risk after the change. For each shadow path, recommend the minimum change to break the transitive path (a single actionable remediation like 'Remove Alice from group X' or 'Detach policy ARN'). Also include an `executive_summary` that quantifies risk reduction (approximate percentage) and a short business rationale."
     )
+    if rag_context:
+        base = (
+            base
+            + "\n\n--- RETRIEVED CONTEXT (use this to inform risk scoring and MITRE mapping) ---\n"
+            + rag_context
+            + "\n--- END RETRIEVED CONTEXT ---"
+        )
+    return base
 
 
-def analyze(uri: str, user: str, password: str, days: int = 90, model: Optional[str] = None, backend: str = "ollama") -> Dict[str, Any]:
+def analyze(
+    uri: str,
+    user: str,
+    password: str,
+    days: int = 90,
+    model: Optional[str] = None,
+    backend: str = "ollama",
+    embed_fn=None,
+) -> Dict[str, Any]:
     """Run zombie-permission detection and send findings to the LLM, returning parsed JSON.
+
+    If `embed_fn` is provided, runs RAG retrieval to augment the system prompt with
+    semantically relevant IAM security knowledge before calling the LLM.
 
     Returns the parsed JSON if LLM returns valid JSON, else returns a dict with `raw` key.
     """
@@ -231,10 +250,21 @@ def analyze(uri: str, user: str, password: str, days: int = 90, model: Optional[
     try:
         findings = find_zombie_permissions(driver, days=days)
         shadow_paths = find_shadow_admin_paths(driver, max_hops=6)
+
+        rag_context = ""
+        if embed_fn is not None:
+            try:
+                from iamdbagent.rag.retriever import retrieve_iam_context, build_finding_queries
+                queries = build_finding_queries(findings, shadow_paths)
+                rag_context = retrieve_iam_context(driver, queries, embed_fn, top_k=5)
+                if rag_context:
+                    logger.info("RAG context retrieved (%d chars)", len(rag_context))
+            except Exception as exc:
+                logger.warning("RAG retrieval failed, continuing without context: %s", exc)
     finally:
         driver.close()
 
-    system_prompt = _build_system_prompt()
+    system_prompt = _build_system_prompt(rag_context=rag_context)
     user_prompt = (
         f"Findings:\n{json.dumps(findings, indent=2)}\n\n"
         f"Shadow_Admin_Paths:\n{json.dumps(shadow_paths, indent=2)}\n\n"
@@ -242,17 +272,15 @@ def analyze(uri: str, user: str, password: str, days: int = 90, model: Optional[
     )
     llm_out = generate_llm(system_prompt, user_prompt, model=model, backend=backend)
 
-    # Try to parse JSON from LLM output
     try:
         parsed = json.loads(llm_out)
-        # validate
         v_err = _validate_llm_output(parsed, "analyze")
         if v_err:
             return {"raw": llm_out, "validation_error": v_err, "findings": findings, "shadow_paths": shadow_paths}
-        # attach raw detection context for traceability
         parsed.setdefault("_context", {})
         parsed["_context"]["findings"] = findings
         parsed["_context"]["shadow_paths"] = shadow_paths
+        parsed["_context"]["rag_used"] = bool(rag_context)
         return parsed
     except Exception:
         return {"raw": llm_out, "findings": findings, "shadow_paths": shadow_paths}
@@ -371,8 +399,19 @@ def _build_consolidation_prompt(cluster: Dict[str, Any]) -> str:
     return prompt
 
 
-def consolidate_roles(uri: str, user: str, password: str, threshold: float = 0.8, model: Optional[str] = None, backend: str = "ollama") -> Dict[str, Any]:
+def consolidate_roles(
+    uri: str,
+    user: str,
+    password: str,
+    threshold: float = 0.8,
+    model: Optional[str] = None,
+    backend: str = "ollama",
+    embed_fn=None,
+) -> Dict[str, Any]:
     """Find similar role clusters and ask the LLM to suggest consolidated roles.
+
+    If `embed_fn` is provided, runs RAG retrieval per cluster to surface relevant
+    consolidation best practices and risk patterns before calling the LLM.
 
     Returns a dict with `clusters` each containing LLM recommendations.
     """
@@ -380,8 +419,24 @@ def consolidate_roles(uri: str, user: str, password: str, threshold: float = 0.8
     clusters = find_similar_role_clusters(driver, threshold=threshold)
     results = []
     for c in clusters:
+        rag_context = ""
+        if embed_fn is not None:
+            try:
+                from iamdbagent.rag.retriever import retrieve_iam_context
+                role_query = f"Role consolidation for roles: {', '.join(c.get('roles', []))}"
+                perm_queries = [
+                    f"IAM permission: {p.split('|')[0]} on {p.split('|')[1] if '|' in p else '*'}"
+                    for p in c.get("permissions", [])[:10]
+                ]
+                rag_context = retrieve_iam_context(
+                    driver, [role_query] + perm_queries, embed_fn, top_k=4
+                )
+            except Exception as exc:
+                logger.warning("RAG retrieval failed for cluster consolidation: %s", exc)
+
         prompt = _build_consolidation_prompt(c)
-        llm_out = generate_llm(_build_system_prompt(), prompt, model=model, backend=backend)
+        sys_prompt = _build_system_prompt(rag_context=rag_context)
+        llm_out = generate_llm(sys_prompt, prompt, model=model, backend=backend)
         try:
             parsed = json.loads(llm_out)
             v_err = _validate_llm_output(parsed, "consolidation")

@@ -172,5 +172,66 @@ def seed_mock_data(uri: str, user: str, password: str):
     driver.close()
 
 
+def load_sailpoint_graph(uri: str, user: str, password: str, data: dict):
+    """Load SailPoint IAM data into Neo4j.
+
+    Extends load_iam_graph with:
+    - Permission nodes from entitlements
+    - Policy-[:GRANTS]->Permission edges
+    - Role-[:HAS_PERMISSION]->Permission propagation through policies
+    - Identity->Role assignments via HAS_ROLE
+    """
+    load_iam_graph(uri, user, password, data)
+
+    driver = _get_driver(uri, user, password)
+    with driver.session() as session:
+        # Permission nodes from entitlements
+        for ent in data.get("entitlements", []):
+            action = ent.get("attribute") or ent.get("name")
+            resource = ent.get("sourceName") or ent.get("value") or "*"
+            session.execute_write(_tx_upsert_permission, action, resource, None)
+
+        # Policy-[:GRANTS]->Permission from access-profile documents
+        for pol in data.get("policies", []):
+            ap_arn = pol.get("Arn")
+            for stmt in pol.get("Document", []):
+                for action in stmt.get("actions", []):
+                    for resource in stmt.get("resources", []):
+                        session.execute_write(
+                            lambda tx, arn, a, r: tx.run(
+                                "MATCH (pol:Policy {arn:$arn}) "
+                                "MATCH (perm:Permission {action:$action, resource:$resource}) "
+                                "MERGE (pol)-[:GRANTS]->(perm)",
+                                arn=arn, action=a, resource=r,
+                            ),
+                            ap_arn, action, resource,
+                        )
+
+        # Propagate Role-[:HAS_PERMISSION] through HAS_POLICY->GRANTS chain
+        session.execute_write(lambda tx: tx.run(
+            "MATCH (r:Role)-[:HAS_POLICY]->(pol:Policy)-[:GRANTS]->(perm:Permission) "
+            "MERGE (r)-[:HAS_PERMISSION]->(perm)"
+        ))
+
+        # Identity role assignments (HAS_ROLE relationships)
+        for user_obj in data.get("users", []):
+            username = user_obj.get("UserName")
+            for role_id in user_obj.get("Roles", []):
+                session.execute_write(
+                    lambda tx, un, rid: tx.run(
+                        "MATCH (u:User {name:$user_name}) "
+                        "MATCH (r:Role) WHERE r.arn = $role_id OR r.name = $role_id "
+                        "MERGE (u)-[:HAS_ROLE]->(r)",
+                        user_name=un, role_id=rid,
+                    ),
+                    username, role_id,
+                )
+
+    driver.close()
+    logger.info("SailPoint graph loaded: %d identities, %d roles, %d access profiles, %d entitlements",
+                len(data.get("users", [])), len(data.get("roles", [])),
+                len(data.get("policies", [])), len(data.get("entitlements", [])))
+
+
 if __name__ == "__main__":
-    print("neo4j_loader: provides `load_iam_graph` and `seed_mock_data`")
+    print("neo4j_loader: provides `load_iam_graph`, `load_sailpoint_graph`, and `seed_mock_data`")
