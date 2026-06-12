@@ -1,0 +1,31 @@
+version: "3.9"
+
+services:
+  neo4j:
+    image: neo4j:5.20-community
+    ports:
+      - "7474:7474"   # Neo4j Browser
+      - "7687:7687"   # Bolt protocol (used by iamdbagent)
+    environment:
+      NEO4J_AUTH: neo4j/secret
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "secret", "RETURN 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Optional: local Ollama LLM backend (run with: docker compose --profile ollama up -d)
+  ollama:
+    image: ollama/ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    profiles:
+      - ollama
+
+volumes:
+  neo4j_data:
+  ollama_data:

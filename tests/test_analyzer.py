@@ -18,7 +18,7 @@ def _make_driver(records):
 # ---------------------------------------------------------------------------
 
 def test_find_zombie_permissions_returns_list():
-    from src.analyzer import find_zombie_permissions
+    from iamdbagent.analyzer import find_zombie_permissions
 
     rec = MagicMock()
     rec.__getitem__ = lambda self, k: {"action": "s3:Get*", "resource": "*", "last_used": None, "roles": ["r1"]}[k]
@@ -31,7 +31,7 @@ def test_find_zombie_permissions_returns_list():
 
 def test_find_zombie_permissions_null_last_used_included():
     """NULL last_used must appear in results (never-used permissions are highest risk)."""
-    from src.analyzer import find_zombie_permissions
+    from iamdbagent.analyzer import find_zombie_permissions
 
     rec = MagicMock()
     rec.__getitem__ = lambda self, k: {"action": "iam:*", "resource": "*", "last_used": None, "roles": ["admin"]}[k]
@@ -50,7 +50,7 @@ def test_find_zombie_permissions_null_last_used_included():
 
 def test_shadow_path_query_no_parameter_placeholder():
     """Cypher must not contain $max_hops — it must be interpolated."""
-    from src.analyzer import find_shadow_admin_paths
+    from iamdbagent.analyzer import find_shadow_admin_paths
 
     driver, session_ctx = _make_driver([])
     find_shadow_admin_paths(driver, max_hops=4)
@@ -64,7 +64,7 @@ def test_shadow_path_query_no_parameter_placeholder():
 # ---------------------------------------------------------------------------
 
 def test_validate_analyze_schema_valid():
-    from src.analyzer import _validate_llm_output
+    from iamdbagent.analyzer import _validate_llm_output
 
     good = {
         "findings": [
@@ -80,7 +80,7 @@ def test_validate_analyze_schema_valid():
 
 
 def test_validate_analyze_schema_missing_required():
-    from src.analyzer import _validate_llm_output
+    from iamdbagent.analyzer import _validate_llm_output
 
     bad = {"findings": [{"action": "s3:Get*"}]}
     err = _validate_llm_output(bad, "analyze")
@@ -88,7 +88,7 @@ def test_validate_analyze_schema_missing_required():
 
 
 def test_validate_consolidation_requires_remediation_steps():
-    from src.analyzer import _validate_llm_output
+    from iamdbagent.analyzer import _validate_llm_output
 
     missing_steps = {
         "standard_role_name": "dev-read",
@@ -111,7 +111,7 @@ def test_validate_consolidation_requires_remediation_steps():
 
 def test_anthropic_generate_uses_messages_api():
     """Must call client.messages.create, not client.completions.create."""
-    from src.analyzer import anthropic_generate
+    from iamdbagent.analyzer import anthropic_generate
 
     mock_client = MagicMock()
     mock_resp = MagicMock()
@@ -119,13 +119,11 @@ def test_anthropic_generate_uses_messages_api():
     mock_client.messages.create.return_value = mock_resp
 
     with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-        with patch("src.analyzer.Anthropic", return_value=mock_client, create=True):
-            # patch the import inside the function
-            with patch("builtins.__import__", side_effect=lambda name, *a, **kw: __import__(name, *a, **kw)):
-                pass
+        with patch("iamdbagent.analyzer.Anthropic", return_value=mock_client, create=True):
+            pass
 
     # Simpler: patch the module-level import path
-    with patch("src.analyzer.anthropic_generate") as mock_fn:
+    with patch("iamdbagent.analyzer.anthropic_generate") as mock_fn:
         mock_fn.return_value = '{"findings": []}'
         result = mock_fn("sys", "usr")
         assert result == '{"findings": []}'
@@ -136,7 +134,7 @@ def test_anthropic_generate_uses_messages_api():
 # ---------------------------------------------------------------------------
 
 def test_generate_iac_no_wildcard_principal(tmp_path):
-    from src.analyzer import generate_iac_from_policy
+    from iamdbagent.analyzer import generate_iac_from_policy
 
     policy = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:Get*", "Resource": "*"}]}
     paths = generate_iac_from_policy(policy, "test-role", str(tmp_path), principal_arn="arn:aws:iam::123456789012:root")
@@ -147,7 +145,7 @@ def test_generate_iac_no_wildcard_principal(tmp_path):
 
 
 def test_generate_iac_placeholder_when_no_principal(tmp_path):
-    from src.analyzer import generate_iac_from_policy
+    from iamdbagent.analyzer import generate_iac_from_policy
 
     policy = {"Version": "2012-10-17", "Statement": []}
     paths = generate_iac_from_policy(policy, "test-role", str(tmp_path))
@@ -161,7 +159,7 @@ def test_generate_iac_placeholder_when_no_principal(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_ollama_raises_on_connection_failure():
-    from src.analyzer import ollama_generate
+    from iamdbagent.analyzer import ollama_generate
     import requests
 
     with patch("requests.post", side_effect=requests.exceptions.ConnectionError("refused")):

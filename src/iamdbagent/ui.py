@@ -1,7 +1,7 @@
 import os
 import streamlit as st
 import pandas as pd
-from src.analyzer import analyze
+from .analyzer import analyze
 
 
 def main():
@@ -24,14 +24,12 @@ def main():
         st.info("No analysis results yet. Click 'Run Analysis' in the sidebar.")
         return
 
-    # If result contains valid findings
     findings = result.get("findings") if isinstance(result, dict) else None
     if not findings:
         st.error("No findings found in analysis result. Check raw output: see `result`.")
         st.write(result)
         return
 
-    # Build table
     rows = []
     for f in findings:
         rows.append({
@@ -46,7 +44,6 @@ def main():
     st.subheader("High Risk Findings")
     st.dataframe(df)
 
-    # Sidebar: select a finding and show before/after
     st.sidebar.subheader("Before vs After")
     idx = st.sidebar.number_input("Select finding index", min_value=0, max_value=max(0, len(rows)-1), value=0)
     sel = findings[idx]

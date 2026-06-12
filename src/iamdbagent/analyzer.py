@@ -1,11 +1,10 @@
-"""Analyzer module: runs Neo4j queries and forwards findings to a local LLM (Ollama) for recommendations.
+"""Analyzer module: runs Neo4j queries and forwards findings to an LLM for recommendations.
 
 Features:
-- `find_zombie_permissions(driver, days=90)` runs a Cypher query to find permissions not used in `days` days.
-- `ollama_generate(system_prompt, user_prompt, model)` sends prompts to a local Ollama HTTP API if available.
-- `analyze(uri, user, password, days=90, model=None)` orchestrates query -> LLM -> parsed JSON output.
-
-The LLM is instructed to act as a Senior IAM Engineer and return structured JSON recommendations.
+- `find_zombie_permissions(driver, days=90)` — permissions not used in `days` days.
+- `find_shadow_admin_paths(driver)` — transitive privilege escalation paths.
+- `analyze(uri, user, password, ...)` — orchestrates query -> LLM -> parsed JSON output.
+- `consolidate_roles(uri, user, password, ...)` — clusters similar roles and proposes merges.
 """
 from neo4j import GraphDatabase
 import datetime
@@ -72,7 +71,6 @@ def find_shadow_admin_paths(driver, max_hops: int = 6) -> List[Dict[str, Any]]:
         for record in res:
             path = record["path"]
             nodes = []
-            # `path` is a neo4j.graph.Path; extract node labels and properties
             for n in path.nodes:
                 nodes.append({"labels": list(n.labels), "props": dict(n)})
             out.append({
@@ -84,22 +82,26 @@ def find_shadow_admin_paths(driver, max_hops: int = 6) -> List[Dict[str, Any]]:
     return out
 
 
-def ollama_generate(system_prompt: str, user_prompt: str, model: Optional[str] = None, timeout: int = 30) -> str:
-    """Send prompts to a local Ollama instance. Falls back to a simple heuristic if Ollama isn't reachable.
+def _is_sailpoint_data(driver) -> bool:
+    """Return True if Neo4j contains SailPoint-sourced Role or Permission nodes."""
+    with driver.session() as session:
+        result = session.run(
+            "MATCH (r:Role) WHERE r.Source STARTS WITH 'sailpoint:' RETURN count(r) AS n LIMIT 1"
+        )
+        record = result.single()
+        return (record["n"] if record else 0) > 0
 
-    Expects Ollama HTTP API at http://localhost:11434/api/generate
-    Body: {"model": "<model>", "prompt": "<combined prompt>"}
-    """
+
+def ollama_generate(system_prompt: str, user_prompt: str, model: Optional[str] = None, timeout: int = 30) -> str:
+    """Send prompts to a local Ollama instance."""
     url = "http://localhost:11434/api/generate"
     model = model or "llama2"
-    # enforce JSON-only output via prompt wrapper
     json_guard = "OUTPUT MUST BE VALID JSON ONLY. DO NOT OUTPUT ANY EXPLANATION OR MARKDOWN."
     combined = f"<SYSTEM>\n{system_prompt}\n{json_guard}\n</SYSTEM>\n<USER>\n{user_prompt}\n</USER>"
     try:
         resp = requests.post(url, json={"model": model, "prompt": combined}, timeout=timeout)
         resp.raise_for_status()
         data = resp.json()
-        # Ollama may stream; try to extract text safely
         if isinstance(data, dict) and "output" in data:
             return data["output"]
         if isinstance(data, dict) and "text" in data:
@@ -124,7 +126,6 @@ def openai_generate(system_prompt: str, user_prompt: str, model: Optional[str] =
             {"role": "user", "content": user_prompt},
         ]
         resp = openai.ChatCompletion.create(model=model, messages=messages, timeout=timeout)
-        # get text
         if resp and "choices" in resp and len(resp["choices"]) > 0:
             return resp["choices"][0]["message"]["content"]
         return json.dumps(resp)
@@ -214,11 +215,21 @@ def _validate_llm_output(parsed: Dict[str, Any], schema_name: str) -> Optional[s
         return str(e)
 
 
-def _build_system_prompt(rag_context: str = "") -> str:
+def _build_system_prompt(rag_context: str = "", sailpoint: bool = False) -> str:
+    sailpoint_hint = ""
+    if sailpoint:
+        sailpoint_hint = (
+            "\n\nData source: SailPoint IdentityNow. Findings represent SailPoint identities, roles, "
+            "access profiles, and entitlements. Remediation steps should reference SailPoint-native "
+            "actions (e.g. 'Revoke entitlement in IdentityNow', 'Remove access profile from identity', "
+            "'Trigger access certification campaign for this role') rather than AWS-specific actions."
+        )
+
     base = (
         "You are a Senior IAM Engineer. Given raw findings from an IAM graph and any transitive path contexts, produce a "
         "single JSON object with the following schema:\n{\n  \"findings\": [ {\n    \"action\": \"<action>\",\n    \"resource\": \"<resource>\",\n    \"last_used\": \"<iso>\",\n    \"roles\": [\"role1\"],\n    \"risk\": \"LOW|MEDIUM|HIGH\",\n    \"risk_score\": \"<1-10>\",\n    \"risk_score_after\": \"<1-10|null>\",\n    \"mitre_technique\": \"<TXXXX>\",\n    \"justification\": \"<text>\",\n    \"suggested_policy\": {\n      \"Version\": \"2012-10-17\",\n      \"Statement\": [ { \"Effect\": \"Allow\", \"Action\": [\"...\"], \"Resource\": [\"...\"] } ]\n    },\n    \"remediation_steps\": [\"Remove user from group X\", \"Detach policy Y from role Z\"]\n  } ],\n  \"shadow_admin_paths\": [ {\n    \"user\": \"<user>\",\n    \"action\": \"<action>\",\n    \"resource\": \"<resource>\",\n    \"path\": [ { \"labels\": [\"User\"], \"props\": {\"name\": \"Alice\"} }, ... ]\n  } ],\n  \"overall_risk\": \"LOW|MEDIUM|HIGH\",\n  \"summary\": \"<text>\",\n  \"executive_summary\": \"<one-paragraph CISO-friendly summary of risk reduction and business impact>\"\n}\n\n"
         "Be explicit: for each finding include a `mitre_technique` (e.g. TXXXX) and a numeric `risk_score` (1-10). If you propose a remediation, include an estimated `risk_score_after` (1-10) showing the expected risk after the change. For each shadow path, recommend the minimum change to break the transitive path (a single actionable remediation like 'Remove Alice from group X' or 'Detach policy ARN'). Also include an `executive_summary` that quantifies risk reduction (approximate percentage) and a short business rationale."
+        + sailpoint_hint
     )
     if rag_context:
         base = (
@@ -250,11 +261,12 @@ def analyze(
     try:
         findings = find_zombie_permissions(driver, days=days)
         shadow_paths = find_shadow_admin_paths(driver, max_hops=6)
+        sailpoint = _is_sailpoint_data(driver)
 
         rag_context = ""
         if embed_fn is not None:
             try:
-                from iamdbagent.rag.retriever import retrieve_iam_context, build_finding_queries
+                from .rag.retriever import retrieve_iam_context, build_finding_queries
                 queries = build_finding_queries(findings, shadow_paths)
                 rag_context = retrieve_iam_context(driver, queries, embed_fn, top_k=5)
                 if rag_context:
@@ -264,7 +276,7 @@ def analyze(
     finally:
         driver.close()
 
-    system_prompt = _build_system_prompt(rag_context=rag_context)
+    system_prompt = _build_system_prompt(rag_context=rag_context, sailpoint=sailpoint)
     user_prompt = (
         f"Findings:\n{json.dumps(findings, indent=2)}\n\n"
         f"Shadow_Admin_Paths:\n{json.dumps(shadow_paths, indent=2)}\n\n"
@@ -281,18 +293,10 @@ def analyze(
         parsed["_context"]["findings"] = findings
         parsed["_context"]["shadow_paths"] = shadow_paths
         parsed["_context"]["rag_used"] = bool(rag_context)
+        parsed["_context"]["sailpoint"] = sailpoint
         return parsed
     except Exception:
         return {"raw": llm_out, "findings": findings, "shadow_paths": shadow_paths}
-
-
-if __name__ == "__main__":
-    import os
-    uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-    user = os.getenv("NEO4J_USER", "neo4j")
-    password = os.getenv("NEO4J_PASS", "password")
-    out = analyze(uri, user, password)
-    print(json.dumps(out, indent=2))
 
 
 def _get_roles_permissions(driver) -> Dict[str, set]:
@@ -312,10 +316,7 @@ def _get_roles_permissions(driver) -> Dict[str, set]:
 
 
 def compute_role_similarities(role_perms: Dict[str, set]) -> List[Dict[str, Any]]:
-    """Compute Jaccard similarity between all role pairs.
-
-    Returns list of {role_a, role_b, intersection, union, jaccard}
-    """
+    """Compute Jaccard similarity between all role pairs."""
     roles = list(role_perms.keys())
     results = []
     for i in range(len(roles)):
@@ -338,21 +339,16 @@ def compute_role_similarities(role_perms: Dict[str, set]) -> List[Dict[str, Any]
 
 
 def find_similar_role_clusters(driver, threshold: float = 0.8) -> List[Dict[str, Any]]:
-    """Identify clusters of roles with pairwise similarity >= threshold using graph connectivity.
-
-    Returns list of clusters: {roles: [...], permissions: [...]}
-    """
+    """Identify clusters of roles with pairwise similarity >= threshold."""
     role_perms = _get_roles_permissions(driver)
     sims = compute_role_similarities(role_perms)
 
-    # build adjacency
     adj = {r: set() for r in role_perms.keys()}
     for s in sims:
         if s["jaccard"] >= threshold:
             adj[s["role_a"]].add(s["role_b"])
             adj[s["role_b"]].add(s["role_a"])
 
-    # find connected components
     visited = set()
     clusters = []
     for r in adj:
@@ -370,7 +366,6 @@ def find_similar_role_clusters(driver, threshold: float = 0.8) -> List[Dict[str,
                 if nbr not in visited:
                     stack.append(nbr)
         if len(comp) > 1:
-            # compute union of permissions
             perms_union = set()
             for role in comp:
                 perms_union.update(role_perms.get(role, set()))
@@ -379,7 +374,6 @@ def find_similar_role_clusters(driver, threshold: float = 0.8) -> List[Dict[str,
 
 
 def _build_consolidation_prompt(cluster: Dict[str, Any]) -> str:
-    """Create a system/user prompt asking the LLM to propose a standardized role for the cluster."""
     roles = cluster.get("roles", [])
     perms = cluster.get("permissions", [])
     example_perm_lines = []
@@ -408,13 +402,7 @@ def consolidate_roles(
     backend: str = "ollama",
     embed_fn=None,
 ) -> Dict[str, Any]:
-    """Find similar role clusters and ask the LLM to suggest consolidated roles.
-
-    If `embed_fn` is provided, runs RAG retrieval per cluster to surface relevant
-    consolidation best practices and risk patterns before calling the LLM.
-
-    Returns a dict with `clusters` each containing LLM recommendations.
-    """
+    """Find similar role clusters and ask the LLM to suggest consolidated roles."""
     driver = _get_driver(uri, user, password)
     clusters = find_similar_role_clusters(driver, threshold=threshold)
     results = []
@@ -422,7 +410,7 @@ def consolidate_roles(
         rag_context = ""
         if embed_fn is not None:
             try:
-                from iamdbagent.rag.retriever import retrieve_iam_context
+                from .rag.retriever import retrieve_iam_context
                 role_query = f"Role consolidation for roles: {', '.join(c.get('roles', []))}"
                 perm_queries = [
                     f"IAM permission: {p.split('|')[0]} on {p.split('|')[1] if '|' in p else '*'}"
@@ -457,16 +445,12 @@ def generate_iac_from_policy(
 ) -> Dict[str, str]:
     """Generate IaC artifacts from a suggested IAM policy.
 
-    Writes two files to `output_dir`: `<standard_role_name>_policy.json` and `<standard_role_name>.tf`.
+    Writes `<standard_role_name>_policy.json` and `<standard_role_name>.tf` to `output_dir`.
     Returns dict with paths: {"json": path, "tf": path}
-    `principal_arn` is required for a valid assume_role_policy; omitting it produces a placeholder that must be updated before applying.
     """
-    import os
-
     if not principal_arn:
         logger.warning(
-            "No principal_arn provided for role '%s' — generated Terraform assume_role_policy uses a placeholder. "
-            "Update REPLACE_WITH_PRINCIPAL_ARN before applying.",
+            "No principal_arn provided for role '%s' — Terraform assume_role_policy uses a placeholder.",
             standard_role_name,
         )
 
@@ -475,11 +459,9 @@ def generate_iac_from_policy(
     json_path = os.path.join(output_dir, f"{safe_name}_policy.json")
     tf_path = os.path.join(output_dir, f"{safe_name}.tf")
 
-    # Write policy JSON
     with open(json_path, "w") as f:
         json.dump(suggested_policy, f, indent=2)
 
-    # Build Terraform content: policy, role, and attachment
     role_res_name = f"{safe_name}_role"
     attach_res_name = f"{safe_name}_attach"
 
@@ -514,8 +496,7 @@ def generate_iac_from_policy(
         f"}}\n"
     )
 
-    tf_content = tf_policy + tf_role + tf_attach
     with open(tf_path, "w") as f:
-        f.write(tf_content)
+        f.write(tf_policy + tf_role + tf_attach)
 
     return {"json": json_path, "tf": tf_path}

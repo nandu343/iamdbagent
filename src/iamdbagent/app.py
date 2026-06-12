@@ -1,7 +1,7 @@
 import os
 import streamlit as st
 from neo4j import GraphDatabase
-from src.analyzer import find_zombie_permissions, find_shadow_admin_paths
+from .analyzer import find_zombie_permissions, find_shadow_admin_paths
 import json
 import networkx as nx
 from pyvis.network import Network
@@ -41,12 +41,10 @@ def main():
 
         st.subheader("Shadow Admin Paths")
         st.write(f"Found {len(shadow)} potential transitive admin paths")
-        # Build a pyvis graph from shadow paths
         net = Network(height="600px", width="100%", notebook=False)
         g = nx.DiGraph()
         for s in shadow:
             path = s.get("path", [])
-            # create nodes and edges
             prev_id = None
             for idx, node in enumerate(path):
                 node_id = f"{s.get('user')}_{idx}_{'_'.join(node.get('labels', []))}"
@@ -57,13 +55,11 @@ def main():
                     g.add_edge(prev_id, node_id)
                 prev_id = node_id
 
-        # load into pyvis
         for n, data in g.nodes(data=True):
             net.add_node(n, label=data.get("label"))
         for a, b in g.edges():
             net.add_edge(a, b)
 
-        # generate HTML and embed
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
         net.show(tmp.name)
         with open(tmp.name, "r", encoding="utf-8") as f:

@@ -185,11 +185,12 @@ def load_sailpoint_graph(uri: str, user: str, password: str, data: dict):
 
     driver = _get_driver(uri, user, password)
     with driver.session() as session:
-        # Permission nodes from entitlements
+        # Permission nodes from entitlements — carry last_used from identity activity if available
         for ent in data.get("entitlements", []):
             action = ent.get("attribute") or ent.get("name")
             resource = ent.get("sourceName") or ent.get("value") or "*"
-            session.execute_write(_tx_upsert_permission, action, resource, None)
+            last_used = ent.get("last_used")  # None if no identity activity data found
+            session.execute_write(_tx_upsert_permission, action, resource, last_used)
 
         # Policy-[:GRANTS]->Permission from access-profile documents
         for pol in data.get("policies", []):

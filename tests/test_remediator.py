@@ -25,7 +25,7 @@ RECOMMENDATION = {
 # ---------------------------------------------------------------------------
 
 def test_preview_consolidation_no_file_writes(tmp_path):
-    from src.remediator import preview_consolidation
+    from iamdbagent.remediator import preview_consolidation
 
     result = preview_consolidation(CLUSTER, RECOMMENDATION)
     assert "removed_permissions_count" in result
@@ -36,7 +36,7 @@ def test_preview_consolidation_no_file_writes(tmp_path):
 
 
 def test_preview_consolidation_correct_delta():
-    from src.remediator import preview_consolidation
+    from iamdbagent.remediator import preview_consolidation
 
     result = preview_consolidation(CLUSTER, RECOMMENDATION)
     # suggested_policy only has s3:GetObject|*, so s3:PutObject|* and iam:ListRoles|* are removed
@@ -48,7 +48,7 @@ def test_preview_consolidation_correct_delta():
 # ---------------------------------------------------------------------------
 
 def test_stage_consolidation_writes_files(tmp_path):
-    from src.remediator import stage_consolidation
+    from iamdbagent.remediator import stage_consolidation
 
     summary = stage_consolidation(CLUSTER, RECOMMENDATION, str(tmp_path))
     assert "files" in summary
@@ -59,7 +59,7 @@ def test_stage_consolidation_writes_files(tmp_path):
 
 
 def test_stage_consolidation_json_valid(tmp_path):
-    from src.remediator import stage_consolidation
+    from iamdbagent.remediator import stage_consolidation
 
     stage_consolidation(CLUSTER, RECOMMENDATION, str(tmp_path))
     data = json.loads(tmp_path.joinpath("dev-unified_policy.json").read_text())
@@ -71,7 +71,7 @@ def test_stage_consolidation_json_valid(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_stage_analysis_fix_with_finding_policy(tmp_path):
-    from src.remediator import stage_analysis_fix
+    from iamdbagent.remediator import stage_analysis_fix
 
     analysis = {
         "findings": [
@@ -93,7 +93,7 @@ def test_stage_analysis_fix_with_finding_policy(tmp_path):
 
 
 def test_stage_analysis_fix_skips_finding_without_policy(tmp_path):
-    from src.remediator import stage_analysis_fix
+    from iamdbagent.remediator import stage_analysis_fix
 
     analysis = {
         "findings": [
@@ -110,7 +110,7 @@ def test_stage_analysis_fix_skips_finding_without_policy(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_preview_analysis_fix_no_writes(tmp_path):
-    from src.remediator import preview_analysis_fix
+    from iamdbagent.remediator import preview_analysis_fix
 
     analysis = {
         "findings": [
